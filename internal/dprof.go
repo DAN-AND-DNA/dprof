@@ -32,16 +32,24 @@ type dumpMsg struct {
 /*
 dProf
 
-1. 根据信号量来手动输出pprof文件（需要手动关闭或杀死进程）
+1. 根据信号量来手动输出pprof文件
 
-2. 根据cpu、内存的阈值自动输出pprof文件（持续5s）
+2. 根据cpu、内存的阈值自动输出pprof文件（持续5s），已经开始的剖析不可中断，新来的请求会被忽略（特殊情况是手动剖析会中断全部自动剖析）
+
+	cpu：（当前cpu值 >= 阈值） 且 （时间1 < 时间2 < 当前时间 认为是上升阶段） 且 （已经cd完毕），输出持续10秒的剖析记录，cd时间为10秒，最大保持100个cpu pprof文件(平均1k、2k的文件)
+
+	内存：（当前内存值 >= 阈值） 且 （时间1 < 时间2 < 当前时间 认为是上升阶段）且 （已经cd完毕），输出持续10秒的剖析记录，cd时间为10秒，最大保持100个内存 pprof文件(平均1k、2k的文件)
 
 3. io 请求超时，根据堆栈hash输出一份pprof文件
 
-4. pprof可以自动告警或远程
+4. 自动分析pprof文件，以日志形式输出pprof关键信息
+
+5. pprof可以自动告警或远程
 */
 type dProf struct {
-	isStarted     bool
+	isStarted    bool
+	isCpuStarted bool
+
 	config        Config
 	dumpClosers   map[string]func()
 	signalChan    chan os.Signal
@@ -72,14 +80,32 @@ func New() *dProf {
 		dumpClosers: make(map[string]func()),
 	}
 
-	var next <-chan time.Time
+	var interval <-chan time.Time
+
+	go func() {
+		for {
+			select {
+			case _ = <-interval:
+				// 间隔时间到
+				if !d.isCpuStarted {
+					continue
+				}
+
+				d.stopDumpCPU()
+				d.isCpuStarted = false
+			case _ = <-d.done:
+				return
+			}
+		}
+	}()
+
 	go func() {
 		for {
 			select {
 			case msg := <-d.dumpChan:
 				switch msg.DumpType {
 				case DumpSignal:
-					// 手动 暂停全部
+					// 手动模式，暂停之前全部启动的剖析
 					if d.isStarted {
 						d.stopDumpCPU()
 					} else {
@@ -88,12 +114,14 @@ func New() *dProf {
 					}
 
 				case DumpCPU:
-					next = time.After(5 * time.Second)
+					// 自动模式，对cpu剖析，持续5s
+					if d.isCpuStarted {
+						continue
+					}
+					d.isCpuStarted = true
+					interval = time.After(5 * time.Second)
 					d.dumpCPU()
 				}
-			case _ = <-next:
-				// 暂停上次cpu
-				d.stopDumpCPU()
 			case _ = <-d.done:
 				return
 			}
@@ -102,6 +130,25 @@ func New() *dProf {
 
 	return d
 }
+
+func (d *dProf) RefreshCpuUsage() {
+	interval := time.Millisecond * 250
+	go func() {
+		cpuTicker := time.NewTicker(interval)
+		defer cpuTicker.Stop()
+
+		for {
+			select {
+			case <-cpuTicker.C:
+
+			case <-d.done:
+				return
+			}
+		}
+
+	}()
+}
+
 func (d *dProf) SetConfig(config ...Config) *dProf {
 	// 默认配置
 	defaultConfig := Config{
