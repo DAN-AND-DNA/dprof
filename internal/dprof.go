@@ -47,15 +47,16 @@ dProf
 5. pprof可以自动告警或远程
 */
 type dProf struct {
-	isStarted    bool
-	isCpuStarted bool
-
+	isStarted     bool
+	isCpuStarted  bool
 	config        Config
 	dumpClosers   map[string]func()
 	signalChan    chan os.Signal
 	dumpChan      chan dumpMsg
 	lastStartUnix map[int]int64
 	done          chan struct{}
+
+	stat *Stat
 }
 
 type Config struct {
@@ -65,19 +66,32 @@ type Config struct {
 func GetSingleInst() *dProf {
 	if singleInst == nil {
 		once.Do(func() {
-			singleInst = New().SetConfig()
+			singleInst = newDProf()
+			err := singleInst.Init()
+			if err != nil {
+				panic(err)
+			}
 		})
 	}
 
 	return singleInst
 }
-
-func New() *dProf {
+func newDProf() *dProf {
 	d := &dProf{
 		signalChan:  make(chan os.Signal, 1),
 		dumpChan:    make(chan dumpMsg, 2000),
 		done:        make(chan struct{}),
 		dumpClosers: make(map[string]func()),
+		stat:        NewStat(),
+	}
+
+	return d
+}
+
+func (d *dProf) Init() error {
+	err := d.stat.Init()
+	if err != nil {
+		return err
 	}
 
 	var interval <-chan time.Time
@@ -128,7 +142,7 @@ func New() *dProf {
 		}
 	}()
 
-	return d
+	return nil
 }
 
 func (d *dProf) RefreshCpuUsage() {
@@ -140,7 +154,7 @@ func (d *dProf) RefreshCpuUsage() {
 		for {
 			select {
 			case <-cpuTicker.C:
-
+				log.Println(d.stat.UpdateCpuUsage())
 			case <-d.done:
 				return
 			}

@@ -15,3 +15,7 @@ func DumpWhenSignal() {
 func DumpWhenCpuThreshold() {
 	internal.GetSingleInst().DumpWhenCpuThreshold()
 }
+
+func RefreshCpuUsage() {
+	internal.GetSingleInst().RefreshCpuUsage()
+}

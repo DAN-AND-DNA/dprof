@@ -1,48 +1,14 @@
 package main
 
 import (
-	"fmt"
 	"github.com/dan-and-dna/dprof"
-	"github.com/dan-and-dna/dprof/internal"
 	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/process"
-	"os"
 	"time"
 )
 
 func main() {
-	//dprof.DumpWhenSignal()
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		panic(err)
-	}
-	go func() {
-
-		for {
-
-			cp, err := p.Times()
-			if err != nil {
-				panic(err)
-			}
-
-			_ = cp
-
-			c, err := internal.GetCGroup()
-			if err != nil {
-				panic(err)
-			}
-
-			fmt.Println(c.GetUsage())
-
-			fmt.Println(internal.GetCpuUsage())
-
-			//fmt.Println(get_cpu_usage())
-			//fmt.Println((cp.System + cp.User) / cp.Total())
-
-			time.Sleep(1 * time.Second)
-		}
-	}()
-
+	dprof.RefreshCpuUsage()
+	
 	dprof.DumpWhenCpuThreshold()
 	//time.Sleep(5 * time.Second)
 	for i := 0; i < 1000; i++ {

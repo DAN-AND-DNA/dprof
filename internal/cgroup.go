@@ -10,15 +10,28 @@ import (
 )
 
 var (
-	ErrorBadCGroupV1File = errors.New("bad cgroup v1 file")
+	ErrorBadCgroupInfo = errors.New("bad cgroup info")
+	ErrorNoCpusetDir   = errors.New("no cpuset dir")
+	ErrorNoCpuacctDir  = errors.New("no cpuacct dir")
+	ErrorNoCpuDir      = errors.New("no cpu dir")
 )
 
-type CGroup struct {
+type Cgroup struct {
+	cgroupProcPath string
+	cgroupFSPath   string
+
 	data map[string]string
 }
 
+func NewCgroup() *Cgroup {
+	return &Cgroup{
+		cgroupProcPath: fmt.Sprintf("/proc/%d/cgroup", os.Getpid()),
+		cgroupFSPath:   "/sys/fs/cgroup",
+	}
+}
+
 /*
-GetCGroup 获得当前进程所处的cgroup信息，目前只支持v1版本的cgroup
+Init 获得当前进程所处的cgroup信息，目前只支持v1版本的cgroup
 
 	cgroup 文件的一般格式
 
@@ -33,22 +46,20 @@ GetCGroup 获得当前进程所处的cgroup信息，目前只支持v1版本的cg
 	2:freezer:/
 	1:name=systemd:/system.slice/tuned.service
 */
-func GetCGroup() (*CGroup, error) {
-	cgroupPath := fmt.Sprintf("/proc/%d/cgroup", os.Getpid())
-
-	lines, err := ReadLines(cgroupPath)
+func (c *Cgroup) Init() error {
+	lines, err := ReadLines(c.cgroupProcPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	ret := &CGroup{
-		data: make(map[string]string),
+	if c.data == nil {
+		c.data = make(map[string]string)
 	}
 
 	for _, line := range lines {
 		cols := strings.Split(line, ":")
 		if len(cols) != 3 {
-			return nil, ErrorBadCGroupV1File
+			return ErrorBadCgroupInfo
 		}
 		if !strings.HasPrefix(cols[1], "cpu") {
 			continue
@@ -56,17 +67,17 @@ func GetCGroup() (*CGroup, error) {
 
 		dirNames := strings.Split(cols[1], ",")
 		for _, dirName := range dirNames {
-			ret.data[dirName] = path.Join("/sys/fs/cgroup", dirName)
+			c.data[dirName] = path.Join(c.cgroupFSPath, dirName)
 		}
 	}
 
-	return ret, nil
+	return nil
 }
 
-func (cgroup *CGroup) GetUsage() (uint64, error) {
+func (cgroup *Cgroup) GetUsage() (uint64, error) {
 	basePath, ok := cgroup.data["cpuacct"]
 	if !ok {
-		return 0, nil
+		return 0, ErrorNoCpuacctDir
 	}
 
 	fullPath := path.Join(basePath, "cpuacct.usage")
@@ -84,11 +95,11 @@ func (cgroup *CGroup) GetUsage() (uint64, error) {
 	return val, nil
 }
 
-// GetQuotaUs 获取当前进程所属的cgroup的每个时间周期可使用的cpu时间数，单位us
-func (cgroup *CGroup) GetQuotaUs() (uint64, error) {
+// GetQuotaUs 获取当前进程所属的cgroup的每个时间周期可使用的cpu时间数，单位us，-1代表全部cpu时间数
+func (cgroup *Cgroup) GetQuotaUs() (int64, error) {
 	basePath, ok := cgroup.data["cpu"]
 	if !ok {
-		return 0, nil
+		return 0, ErrorNoCpuDir
 	}
 
 	fullPath := path.Join(basePath, "cpu.cfs_quota_us")
@@ -98,7 +109,7 @@ func (cgroup *CGroup) GetQuotaUs() (uint64, error) {
 		return 0, err
 	}
 
-	val, err := strconv.ParseUint(line, 10, 64)
+	val, err := strconv.ParseInt(line, 10, 64)
 	if err != nil {
 		return 0, err
 	}
@@ -107,10 +118,10 @@ func (cgroup *CGroup) GetQuotaUs() (uint64, error) {
 }
 
 // GetPeriodUs 获取当前进程所属的cgroup的时间周期，能使用的cpu核心数=cpu时间数/时间周期，单位us
-func (cgroup *CGroup) GetPeriodUs() (uint64, error) {
+func (cgroup *Cgroup) GetPeriodUs() (uint64, error) {
 	basePath, ok := cgroup.data["cpu"]
 	if !ok {
-		return 0, nil
+		return 0, ErrorNoCpuDir
 	}
 
 	fullPath := path.Join(basePath, "cpu.cfs_period_us")
@@ -128,24 +139,57 @@ func (cgroup *CGroup) GetPeriodUs() (uint64, error) {
 	return val, nil
 }
 
-// GetCpus 获取当前进程所属的cgroup可使用的cpu核心编号
-func (cgroup *CGroup) GetCpus() (uint64, error) {
+/*
+GetCpus 获取当前进程所属的cgroup可使用的cpu核心编号，所谓亲和
+格式为 0-3,6
+*/
+func (cgroup *Cgroup) GetCpus() ([]uint64, error) {
 	basePath, ok := cgroup.data["cpuset"]
 	if !ok {
-		return 0, nil
+		return nil, ErrorBadCPUStat
 	}
 
 	fullPath := path.Join(basePath, "cpuset.cpus")
 
 	line, err := ReadLine(fullPath)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	val, err := strconv.ParseUint(line, 10, 64)
-	if err != nil {
-		return 0, err
+	list := make(map[uint64]struct{})
+	cpuIdRanges := strings.Split(line, ",")
+	for _, cpuIdRange := range cpuIdRanges {
+		if strings.Contains(cpuIdRange, "-") {
+			// cpu编号范围
+			cpuIds := strings.SplitN(cpuIdRange, "-", 2)
+			min, err := strconv.ParseUint(cpuIds[0], 10, 64)
+			if err != nil {
+				return nil, err
+			}
+
+			max, err := strconv.ParseUint(cpuIds[1], 10, 64)
+			if err != nil {
+				return nil, err
+			}
+
+			for i := min; i <= max; i++ {
+				list[i] = struct{}{}
+			}
+		} else {
+			// 单独的cpu编号
+			v, err := strconv.ParseUint(cpuIdRange, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+
+			list[v] = struct{}{}
+		}
 	}
 
-	return val, nil
+	var cpus []uint64
+	for k := range list {
+		cpus = append(cpus, k)
+	}
+
+	return cpus, nil
 }
