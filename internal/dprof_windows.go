@@ -1,12 +1,29 @@
 package internal
 
-func (d *dProf) DumpWhenCpuThreshold() {
-	// TODO 检查cpu是否超过阈值且距离上次到达阈值已经过去30秒
-	d.dumpChan <- dumpMsg{DumpType: DumpCPU}
-}
+import (
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"time"
+)
 
 func (d *dProf) DumpWhenSignal() {
-
 	d.dumpChan <- dumpMsg{DumpType: DumpSignal}
 
+}
+
+// createDumpFile 尝试创建dump文件
+func (d *dProf) createDumpFile(kind string) (*os.File, error) {
+	// 二进制路径
+	appName := path.Base(filepath.ToSlash(os.Args[0]))
+
+	pprofPath := fmt.Sprintf("./%s-%d-%s-%s.prof", appName, os.Getpid(), kind, time.Now().Format("2006-01-02_15-04-05"))
+	f, err := os.Create(pprofPath)
+	if err != nil {
+		// 直接崩比较好，输出堆栈比较好
+		return nil, err
+	}
+
+	return f, nil
 }

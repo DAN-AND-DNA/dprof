@@ -3,8 +3,6 @@ package internal
 import (
 	"log"
 	"os"
-	"path"
-	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"sync"
@@ -14,12 +12,30 @@ import (
 var (
 	singleInst *dProf = nil
 	once       sync.Once
+
+	intervals = map[int]int64{
+		DumpCPU30: 10,
+		DumpCPU40: 15,
+		DumpCPU50: 30,
+		DumpCPU60: 35,
+		DumpCPU70: 35,
+		DumpCPU80: 40,
+		DumpCPU90: 40,
+	}
 )
 
 const (
 	DumpNone   = 0
 	DumpSignal = iota + 1000
-	DumpCPU
+	DumpCPU10  = 100
+	DumpCPU20  = 200
+	DumpCPU30  = 300
+	DumpCPU40  = 400
+	DumpCPU50  = 500
+	DumpCPU60  = 600
+	DumpCPU70  = 700
+	DumpCPU80  = 800
+	DumpCPU90  = 900
 
 	DumpEOF = 9999
 )
@@ -34,33 +50,34 @@ dProf
 
 1. 根据信号量来手动输出pprof文件
 
-2. 根据cpu、内存的阈值自动输出pprof文件（持续5s），已经开始的剖析不可中断，新来的请求会被忽略（特殊情况是手动剖析会中断全部自动剖析）
+2. 根据cpu、内存、网络超时的阈值自动输出pprof文件（持续5s），已经开始的剖析不可中断，新来的请求会被忽略（特殊情况是手动剖析会中断全部自动剖析）
 
-	cpu：（当前cpu值 >= 阈值） 且 （时间1 < 时间2 < 当前时间 认为是上升阶段） 且 （已经cd完毕），输出持续10秒的剖析记录，cd时间为10秒，最大保持100个cpu pprof文件(平均1k、2k的文件)
+	cpu: 处在不同的档位，以不同的速度输出pprof，首次到达新的档位，直接输出pprof，清理比当前档位高的过期档位
 
-	内存：（当前内存值 >= 阈值） 且 （时间1 < 时间2 < 当前时间 认为是上升阶段）且 （已经cd完毕），输出持续10秒的剖析记录，cd时间为10秒，最大保持100个内存 pprof文件(平均1k、2k的文件)
+	cpu：输出持续5秒的（cpu）剖析记录，cd时间为10秒，最大保持100个cpu pprof文件(平均1k、2k的文件)
 
-3. io 请求超时，根据堆栈hash输出一份pprof文件
+	内存：输出持续5秒的（内存）剖析记录，cd时间为10秒，最大保持100个内存 pprof文件(平均1k、2k的文件)
 
-4. 自动分析pprof文件，以日志形式输出pprof关键信息
+	网络：超时请求统计比例上升，输出（io阻塞）剖析记录
 
-5. pprof可以自动告警或远程
+3. io 请求超时，超时错误，输出堆栈消息
+
+5. 自动分析pprof文件，以日志形式输出pprof关键信息
+
+6. pprof可以自动告警或远程
 */
 type dProf struct {
-	isStarted     bool
-	isCpuStarted  bool
-	config        Config
-	dumpClosers   map[string]func()
-	signalChan    chan os.Signal
-	dumpChan      chan dumpMsg
-	lastStartUnix map[int]int64
-	done          chan struct{}
+	isManualStarted bool
+	isCpuStarted    bool
+	dumpClosers     map[string]func()
+	signalChan      chan os.Signal
+	dumpChan        chan dumpMsg
+	lastStartUnix   map[int]int64
+	nextInterval    map[int]int64
+	done            chan struct{}
 
-	stat *Stat
-}
-
-type Config struct {
-	BaseDir string
+	currCpuUsage uint64
+	stat         Stat
 }
 
 func GetSingleInst() *dProf {
@@ -78,11 +95,13 @@ func GetSingleInst() *dProf {
 }
 func newDProf() *dProf {
 	d := &dProf{
-		signalChan:  make(chan os.Signal, 1),
-		dumpChan:    make(chan dumpMsg, 2000),
-		done:        make(chan struct{}),
-		dumpClosers: make(map[string]func()),
-		stat:        NewStat(),
+		signalChan:    make(chan os.Signal, 1),
+		dumpChan:      make(chan dumpMsg, 2000),
+		lastStartUnix: make(map[int]int64),
+		nextInterval:  make(map[int]int64),
+		done:          make(chan struct{}),
+		dumpClosers:   make(map[string]func()),
+		stat:          NewStat(),
 	}
 
 	return d
@@ -94,47 +113,97 @@ func (d *dProf) Init() error {
 		return err
 	}
 
-	var interval <-chan time.Time
-
-	go func() {
-		for {
-			select {
-			case _ = <-interval:
-				// 间隔时间到
-				if !d.isCpuStarted {
-					continue
-				}
-
-				d.stopDumpCPU()
-				d.isCpuStarted = false
-			case _ = <-d.done:
-				return
-			}
-		}
-	}()
-
 	go func() {
 		for {
 			select {
 			case msg := <-d.dumpChan:
 				switch msg.DumpType {
 				case DumpSignal:
+					log.Println("manual")
 					// 手动模式，暂停之前全部启动的剖析
-					if d.isStarted {
+					if d.isCpuStarted {
 						d.stopDumpCPU()
-					} else {
-						d.dumpCPU()
-						d.isStarted = true
 					}
 
-				case DumpCPU:
-					// 自动模式，对cpu剖析，持续5s
-					if d.isCpuStarted {
+					if d.isManualStarted {
+						d.stopDumpCPU("manual_cpu")
+						d.isManualStarted = false
+					} else {
+						d.dumpCPU("manual_cpu")
+						d.isManualStarted = true
+					}
+
+				case DumpCPU30:
+					fallthrough
+				case DumpCPU40:
+					fallthrough
+				case DumpCPU50:
+					fallthrough
+				case DumpCPU60:
+					fallthrough
+				case DumpCPU70:
+					fallthrough
+				case DumpCPU80:
+					fallthrough
+				case DumpCPU90:
+					if d.isManualStarted {
 						continue
 					}
+
+					lastStartUnix, ok := d.lastStartUnix[msg.DumpType]
+					interval := intervals[msg.DumpType]
+					if ok {
+						// 丢弃没时间的消息
+						if msg.StartUnix <= 0 {
+							log.Println("discard bad start unix")
+							continue
+						}
+
+						if msg.StartUnix <= lastStartUnix {
+							continue
+						}
+
+						// 是否满足执行的间隔时间
+						if msg.StartUnix-lastStartUnix <= interval {
+							continue
+						}
+
+						//log.Println(msg.DumpType, msg.StartUnix-lastStartUnix)
+					}
+
+					// 记录开始时间
+					var pprofDuration int64 = 5
+					d.lastStartUnix[msg.DumpType] = time.Now().Unix() + pprofDuration
+
+					// 有已经在开始的cpu剖析，合并到上一次去
+					// TODO 延长本次时间，避免剩余时间太短，无法捕获突发的cpu升高
+					if d.isCpuStarted == true {
+						continue
+					}
+
 					d.isCpuStarted = true
-					interval = time.After(5 * time.Second)
+					log.Println("dump cpu pprof ", msg.DumpType)
 					d.dumpCPU()
+
+					go func() {
+						onTime := time.After(time.Duration(pprofDuration) * time.Second)
+						for {
+							select {
+							case _ = <-onTime:
+								// 间隔时间到
+								if !d.isCpuStarted {
+									continue
+								}
+
+								log.Println("stop dump ..................")
+								d.stopDumpCPU()
+
+								d.isCpuStarted = false
+							case _ = <-d.done:
+								return
+							}
+						}
+					}()
 				}
 			case _ = <-d.done:
 				return
@@ -145,7 +214,7 @@ func (d *dProf) Init() error {
 	return nil
 }
 
-func (d *dProf) RefreshCpuUsage() {
+func (d *dProf) MonitorCpu() {
 	interval := time.Millisecond * 250
 	go func() {
 		cpuTicker := time.NewTicker(interval)
@@ -154,40 +223,66 @@ func (d *dProf) RefreshCpuUsage() {
 		for {
 			select {
 			case <-cpuTicker.C:
-				log.Println(d.stat.UpdateCpuUsage())
+				d.currCpuUsage = d.stat.UpdateCpuUsage()
+				d.cleanCache()
+
+				// 手动优先级高
+				if d.isManualStarted {
+					continue
+				}
+
+				// 超过总体cpu的30% 40% 60% 70% 80% 90%开始
+				if d.currCpuUsage >= 900 {
+					d.dumpChan <- dumpMsg{DumpType: DumpCPU90, StartUnix: time.Now().Unix()}
+					continue
+				}
+
+				if d.currCpuUsage >= 800 {
+					d.dumpChan <- dumpMsg{DumpType: DumpCPU80, StartUnix: time.Now().Unix()}
+					continue
+				}
+
+				if d.currCpuUsage >= 700 {
+					d.dumpChan <- dumpMsg{DumpType: DumpCPU70, StartUnix: time.Now().Unix()}
+					continue
+				}
+
+				if d.currCpuUsage >= 600 {
+					d.dumpChan <- dumpMsg{DumpType: DumpCPU60, StartUnix: time.Now().Unix()}
+					continue
+				}
+
+				if d.currCpuUsage >= 500 {
+					d.dumpChan <- dumpMsg{DumpType: DumpCPU50, StartUnix: time.Now().Unix()}
+					continue
+				}
+
+				if d.currCpuUsage >= 400 {
+					d.dumpChan <- dumpMsg{DumpType: DumpCPU40, StartUnix: time.Now().Unix()}
+					continue
+				}
+
+				if d.currCpuUsage >= 300 {
+					d.dumpChan <- dumpMsg{DumpType: DumpCPU30, StartUnix: time.Now().Unix()}
+					continue
+				}
+
 			case <-d.done:
 				return
 			}
 		}
-
 	}()
 }
 
-func (d *dProf) SetConfig(config ...Config) *dProf {
-	// 默认配置
-	defaultConfig := Config{
-		BaseDir: "./",
-	}
-
-	// 用户配置覆盖原有的配置
-	if len(config) != 0 {
-		// 文件目录
-		if config[0].BaseDir != "" {
-			defaultConfig.BaseDir = config[0].BaseDir
-		}
-	}
-
-	// TODO 改成atomic配置
-	d.config = defaultConfig
-
-	return d
-}
-
 // TryDumpCPU 尝试输出cpu pprof文件
-func (d *dProf) dumpCPU() {
+func (d *dProf) dumpCPU(rawKind ...string) {
 	defer recover1()
 
 	kind := "cpu"
+	if len(rawKind) != 0 {
+		kind = rawKind[0]
+	}
+
 	f, err := d.createDumpFile(kind)
 	if err != nil {
 		panic(err)
@@ -212,14 +307,18 @@ func (d *dProf) dumpCPU() {
 	}
 }
 
-func (d *dProf) stopDumpCPU() {
+func (d *dProf) stopDumpCPU(rawKind ...string) {
 	kind := "cpu"
-
+	if len(rawKind) != 0 {
+		kind = rawKind[0]
+	}
 	f, ok := d.dumpClosers[kind]
 	if !ok {
 		return
 	}
+	delete(d.dumpClosers, kind)
 	f()
+
 }
 
 // TryDumpBlock 尝试输出io阻塞 pprof文件
@@ -262,26 +361,13 @@ func recover1() {
 	}
 }
 
-// createDumpFile 尝试创建dump文件
-func (d *dProf) createDumpFile(kind string) (*os.File, error) {
-	// 二进制路径
-	var appName = "unknown_golang_app"
-	if runtime.GOOS == "windows" {
-		appName = path.Base(filepath.ToSlash(os.Args[0]))
-	} else {
-		appName = path.Base(os.Args[0])
+// 下降清理之前高于的记录
+func (d *dProf) cleanCache() {
+	currentUnix := time.Now().Unix()
+	for cpuLevel, lastStartUnix := range d.lastStartUnix {
+		// 两分钟没变化
+		if currentUnix-lastStartUnix >= 120 {
+			delete(d.lastStartUnix, cpuLevel)
+		}
 	}
-
-	basePath := d.config.BaseDir
-	_ = basePath
-	_ = appName
-	//pprofPath := path.Join(basePath, fmt.Sprintf("%s-%d-%s-%s.pprof", appName, syscall.Getpid(), kind, time.Now().Format("2006-01-02 15:04:05")))
-	pprofPath := "./ddd.prof"
-	f, err := os.Create(pprofPath)
-	if err != nil {
-		// 直接崩比较好，输出堆栈比较好
-		return nil, err
-	}
-
-	return f, nil
 }
