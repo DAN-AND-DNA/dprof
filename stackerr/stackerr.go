@@ -20,8 +20,8 @@ func New() error {
 }
 
 func (err *StackErr) init() {
-	pc := make([]uintptr, 7)
-	n := runtime.Callers(2, pc)
+	pc := make([]uintptr, 10)
+	n := runtime.Callers(3, pc)
 	if n == 0 {
 		return
 	}
