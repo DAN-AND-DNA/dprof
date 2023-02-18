@@ -3,28 +3,9 @@ package internal
 import (
 	"fmt"
 	"os"
-	"os/signal"
 	"path"
-	"syscall"
 	"time"
 )
-
-func (d *dProf) DumpWhenSignal() {
-	signal.Notify(d.signalChan, syscall.SIGUSR1, syscall.SIGUSR2)
-	go func() {
-		for {
-			select {
-			case v := <-d.signalChan:
-				switch v {
-				case syscall.SIGUSR2:
-					d.dumpChan <- dumpMsg{DumpType: DumpSignal}
-				}
-			case _ = <-d.done:
-				return
-			}
-		}
-	}()
-}
 
 // createDumpFile 尝试创建dump文件
 func (d *dProf) createDumpFile(kind string) (*os.File, error) {

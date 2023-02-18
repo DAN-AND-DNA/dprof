@@ -8,11 +8,6 @@ import (
 	"time"
 )
 
-func (d *dProf) DumpWhenSignal() {
-	d.dumpChan <- dumpMsg{DumpType: DumpSignal}
-
-}
-
 // createDumpFile 尝试创建dump文件
 func (d *dProf) createDumpFile(kind string) (*os.File, error) {
 	// 二进制路径
