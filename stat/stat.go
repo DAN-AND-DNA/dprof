@@ -3,6 +3,7 @@ package stat
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shirou/gopsutil/process"
+	"math"
 	"os"
 	"time"
 )
@@ -30,9 +31,10 @@ var (
 )
 
 type Metrics struct {
-	CpuUsage      int64
-	PrevCpuUsage1 int64
-	PrevCpuUsage2 int64
+	CpuUsage             int64
+	PrevCpuUsage1        int64
+	PrevCpuUsage2        int64
+	CpuUsageStdDeviation float64
 
 	MemUsage      int64
 	PrevMemUsage1 int64
@@ -74,6 +76,13 @@ func (stat *Stat) MonitorProcess() {
 			_gaugeProcessCpuUsage.Set(cpuUsage) // 千分之几
 
 			c1, c2, c3 = cpuUsage, c1, c2
+			// 平均值
+			avgC := (c1 + c2 + c3) / 3
+			// 方差
+			varianceC := (math.Pow(c1-avgC, 2) + math.Pow(c2-avgC, 2) + math.Pow(c3-avgC, 2)) / 3
+			stdDeviation := math.Sqrt(varianceC)
+			stat.Metrics.CpuUsageStdDeviation = stdDeviation
+
 			stat.Metrics.CpuUsage = int64(c1)
 			stat.Metrics.PrevCpuUsage1 = int64(c2)
 			stat.Metrics.PrevCpuUsage2 = int64(c3)
@@ -81,6 +90,7 @@ func (stat *Stat) MonitorProcess() {
 			_gaugeProcessRecentCpuUsageLevel.WithLabelValues("0ms").Set(c1)
 			_gaugeProcessRecentCpuUsageLevel.WithLabelValues("250ms").Set(c2)
 			_gaugeProcessRecentCpuUsageLevel.WithLabelValues("500ms").Set(c3)
+			_gaugeProcessRecentCpuUsageLevel.WithLabelValues("std deviation").Set(stdDeviation)
 
 			// 拿进程的内存
 			memUsage, _ := stat.currentProcess.MemoryPercent()
